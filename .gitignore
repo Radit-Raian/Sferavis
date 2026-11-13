@@ -1,0 +1,26 @@
+# Pipeline outputs (can be many GB of FITS cutouts)
+output/
+*.fits
+*.fits.part
+*.part
+
+# Local config: auto-created from config.default.json and rewritten by the pipeline
+config.json
+
+# Secrets / local settings
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
