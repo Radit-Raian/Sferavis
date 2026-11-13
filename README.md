@@ -1,4 +1,4 @@
-# spherex_mover
+# Sferavis
 
 Config-driven pipeline that finds **unlabeled moving objects** (candidate asteroids / comets) in
 [SPHEREx](https://spherex.caltech.edu/) images. It downloads cutouts from IRSA around a sky position,
