@@ -1,26 +1,78 @@
-# Pipeline outputs (can be many GB of FITS cutouts)
-output/
+```gitignore
+# Pipeline outputs
+output/**
+!output/README.md
+!output/results/
+!output/results/**/*.csv
+!output/results/**/*.png
+!output/results/**/*.pdf
+
+# Large astronomical data
 *.fits
+*.fit
+*.fts
+*.fits.gz
+*.fit.gz
+*.fts.gz
 *.fits.part
 *.part
+*.fz
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
 
-# Local config: auto-created from config.default.json and rewritten by the pipeline
+# Local configuration and secrets
 config.json
-
-# Secrets / local settings
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 .venv/
 venv/
 env/
+spx_env/
 *.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .ipynb_checkpoints/
 
-# OS / editor
+# Jupyter
+.ipython/
+profile_default/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# OS files
 .DS_Store
 Thumbs.db
+Desktop.ini
+
+# Editors
 .vscode/
 .idea/
+*.code-workspace
+
+# Cache and coverage
+.cache/
+.pyre/
+.coverage
+htmlcov/
+```
