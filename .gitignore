@@ -1,11 +1,11 @@
 ```gitignore
-# Pipeline outputs
+# Pipeline outputs: ignore all files by default, keep directory tree traversable
 output/**
+!output/**/
 !output/README.md
-!output/results/
-!output/results/**/*.csv
-!output/results/**/*.png
-!output/results/**/*.pdf
+!output/**/*.csv
+!output/**/*.png
+!output/**/*.pdf
 
 # Large astronomical data
 *.fits
