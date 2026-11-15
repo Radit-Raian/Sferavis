@@ -21,7 +21,8 @@ CONFIG_PATH = os.path.abspath(os.path.expanduser(
     os.environ.get("SPHEREX_CONFIG") or os.path.join(REPO_DIR, "config.json")))
 
 FLAG_NAMES = ["configured", "downloaded", "detected", "gaia_matched",
-              "static_filtered", "tracklets_linked", "known_objects_checked"]
+              "static_filtered", "tracklets_linked", "known_objects_checked",
+              "spectra_extracted", "classified"]
 
 MJD_J2016 = 57388.0  # Gaia DR3 reference epoch (J2016.0)
 
@@ -118,6 +119,15 @@ def build_paths(root):
         "members_csv": t / "tracklet_members.csv",
         "checked_csv": t / "tracklets_known_check.csv",
         "candidates_csv": t / "candidates.csv",
+        # steps 8-9
+        "spectra_dir": root / "spectra",
+        "spectrum_csv": t / "spectrum_points.csv",
+        "classification_csv": t / "classification.csv",
+        "timing_csv": root / "timing.csv",
+        # steps 8-9, static unlabeled sources
+        "static_spectra_dir": root / "static_spectra",
+        "static_spectrum_csv": c / "static_spectrum_points.csv",
+        "static_classification_csv": c / "static_classification.csv",
     }
     return {k: v.as_posix() for k, v in paths.items()}
 
@@ -126,6 +136,10 @@ def get_paths(config):
     p = config.get("paths") or {}
     if not p:
         raise SystemExit("[!] config.json has no 'paths'. Run step1_config.py first.")
+    # configs written by an older version lack the step 8-9 paths: fill them in from the root
+    for k, v in build_paths(p.get("root") or "output").items():
+        if k not in p:
+            p[k] = v
     return {k: abs_path(v) for k, v in p.items()}
 
 

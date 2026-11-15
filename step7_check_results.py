@@ -58,47 +58,56 @@ def check_known(tr, members, kcfg):
 
 
 def make_plot(tr, members, paths, rcfg):
+    """One stamp and one dot for EVERY detection of the tracklet (not one per MJD, not a subset)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from astropy.visualization import ImageNormalize, ZScaleInterval
 
     m = members[members["tracklet_id"] == tr["tracklet_id"]].sort_values("mjd").reset_index(drop=True)
-    n_st = min(len(m), 8)
-    sel = np.unique(np.linspace(0, len(m) - 1, n_st).round().astype(int))
+    max_st = int(rcfg.get("max_stamps", 24))
+    sel = np.unique(np.linspace(0, len(m) - 1, min(len(m), max_st)).round().astype(int))
+    ncol = min(len(sel), 8)
+    nrow = int(np.ceil(len(sel) / ncol))
     half = int(rcfg["cutout_pix"]) // 2
-    fig, axes = plt.subplots(2, max(len(sel), 2), figsize=(2.6 * max(len(sel), 2), 6))
-    for ax in axes.ravel():
-        ax.axis("off")
-    for col, k in enumerate(sel):
+    fig = plt.figure(figsize=(2.4 * max(ncol, 3), 2.5 * nrow + 4.5))
+    gs = fig.add_gridspec(nrow + 2, ncol, height_ratios=[1] * nrow + [1.6, 1.2])
+    for n, k in enumerate(sel):
         r = m.iloc[k]
+        ax = fig.add_subplot(gs[n // ncol, n % ncol])
+        ax.set_xticks([]), ax.set_yticks([])
         data, _, _, _ = helpers.read_image(os.path.join(paths["images_dir"], r["file"]))
         xc, yc = int(round(r["x_pix"])), int(round(r["y_pix"]))
         y0, x0 = max(yc - half, 0), max(xc - half, 0)
         stamp = data[y0:yc + half + 1, x0:xc + half + 1]
-        ax = axes[0, col]
-        ax.axis("on")
-        ax.set_xticks([]), ax.set_yticks([])
         if np.isfinite(stamp).any():
             ax.imshow(stamp, origin="lower", cmap="gray",
                       norm=ImageNormalize(stamp, interval=ZScaleInterval()))
         ax.plot(r["x_pix"] - x0, r["y_pix"] - y0, "o", mfc="none", mec="r", ms=14)
-        ax.set_title(f"MJD {r['mjd']:.3f}\nSNR {r['snr']:.1f}", fontsize=7)
-    gs = axes[1, 0].get_gridspec()
-    for ax in axes[1, :]:
-        ax.remove()
-    axs = fig.add_subplot(gs[1, :])
+        ax.set_title(f"#{k} MJD {r['mjd']:.4f}\nSNR {r['snr']:.1f}", fontsize=6)
+    axs = fig.add_subplot(gs[nrow, :])
     ra0, dec0 = m["ra"].mean(), m["dec"].mean()
     ex, ny = helpers.tangent_offsets(m["ra"], m["dec"], ra0, dec0)
-    sc = axs.scatter(ex, ny, c=(m["mjd"] - m["mjd"].min()) * 24, cmap="viridis")
-    axs.plot(ex, ny, "-", color="grey", lw=0.8)
+    hrs = (m["mjd"] - m["mjd"].min()) * 24
+    if "ra_fit" in m:
+        fx, fy = helpers.tangent_offsets(m["ra_fit"], m["dec_fit"], ra0, dec0)
+        axs.plot(fx, fy, "-", color="grey", lw=0.8, label="linear fit")
+    else:
+        axs.plot(ex, ny, "-", color="grey", lw=0.8)
+    sc = axs.scatter(ex, ny, c=hrs, cmap="viridis", s=28, zorder=3)  # every detection is its own dot
+    for i in range(len(m)):
+        axs.annotate(str(i), (ex[i], ny[i]), fontsize=5, xytext=(2, 2), textcoords="offset points")
     axs.invert_xaxis()
     axs.set_xlabel("East offset (arcsec)")
     axs.set_ylabel("North offset (arcsec)")
     axs.set_aspect("equal", adjustable="datalim")
     fig.colorbar(sc, ax=axs, label="hours since first detection")
-    fig.suptitle(f"Tracklet {tr['tracklet_id']}: {tr['rate_arcsec_hr']:.1f} arcsec/hr, PA {tr['pa_deg']:.0f} deg, "
-                 f"{tr['n_det']} detections, rms {tr['rms_arcsec']:.2f} arcsec", fontsize=10)
+    axr = fig.add_subplot(gs[nrow + 1, :])
+    axr.plot(hrs, m["snr"], "o-", ms=3, lw=0.7)
+    axr.set_xlabel("hours since first detection")
+    axr.set_ylabel("detection S/N")
+    fig.suptitle(f"Tracklet {int(tr['tracklet_id'])}: {tr['rate_arcsec_hr']:.1f} arcsec/hr, PA {tr['pa_deg']:.0f} deg, "
+                 f"{int(tr['n_det'])} detections, rms {tr['rms_arcsec']:.2f} arcsec", fontsize=10)
     out = os.path.join(paths["plot_dir"], f"candidate_{int(tr['tracklet_id']):04d}.png")
     fig.savefig(out, dpi=110, bbox_inches="tight")
     plt.close(fig)

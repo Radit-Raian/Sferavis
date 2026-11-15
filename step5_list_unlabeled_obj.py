@@ -25,6 +25,8 @@ Outputs (catalogs/ folder unless a path is set in config.json -> paths)
   epoch_astrometry.csv         per-epoch Gaia calibration (n_ref, shift, rms, err_calib)
   3_detections_all_flagged.csv every detection with its category (known / known_star / bad_quality / static / moving)
   3_detections_filtered.csv    the 'moving' detections -> input of step 6
+  4_static_near_misses.csv     unlabeled position clusters seen in >= 2 epochs that did NOT become static,
+                               with n_epochs, span_days, mean_snr and the reason
   known_in_field.csv           KNOWN asteroids/comets (SkyBoT) that were inside the cutouts, where
                                each should have been in every exposure, and what step 5 did with the
                                detection found there (outcome = known / static / moving / bad_quality /
@@ -35,6 +37,13 @@ Optional config.json -> "filtering" keys (defaults in brackets)
   static_floor_arcsec [1.0]      smallest allowed match radius
   static_max_radius_arcsec [max(static_radius_arcsec, 10)]   largest allowed match radius
   static_min_span_days [1.0]     a static source must persist at least this long
+  static_min_snr [min_snr]       S/N threshold used ONLY for the static search. Faint QSOs / galaxies are
+                                 rarely above min_snr in a single exposure (each exposure samples a different
+                                 wavelength), so set e.g. 3.0 to find them. Detections between static_min_snr
+                                 and min_snr that do not join a static cluster are dropped (bad_quality);
+                                 they never reach the mover search.
+  static_min_epochs_faint [5]    a cluster whose MEDIAN S/N is below min_snr needs at least this many epochs
+                                 (random low-S/N noise lines up in 3 epochs by chance; real sources persist).
   min_ref_stars [5]              Gaia stars needed to calibrate an epoch
   apply_epoch_shift [true]       apply the per-epoch Gaia shift to ra/dec
   centroid_error_scale [1.0]     multiplier on sigma_PSF/SNR
@@ -265,9 +274,14 @@ def main():
     n0 = len(det)
 
     # ---- 1. quality cuts
-    good = ((det["snr"] >= f["min_snr"]) & det["fwhm"].between(f["min_fwhm_pix"], f["max_fwhm_pix"])
-            & (det["elongation"] <= f["max_elongation"]) & (det["edge_dist"] >= f["edge_margin_pix"]))
-    log.info("quality cuts: %d -> %d", n0, int(good.sum()))
+    shape_ok = (det["fwhm"].between(f["min_fwhm_pix"], f["max_fwhm_pix"])
+                & (det["elongation"] <= f["max_elongation"]) & (det["edge_dist"] >= f["edge_margin_pix"]))
+    good = (det["snr"] >= f["min_snr"]) & shape_ok
+    snr_static = min(float(f.get("static_min_snr", f["min_snr"])), float(f["min_snr"]))
+    good_lo = (det["snr"] >= snr_static) & shape_ok  # detections allowed into the STATIC search
+    log.info("quality cuts: %d -> %d (S/N >= %.1f and shape ok); %d more fail ONLY the S/N cut, %d of them "
+             "have S/N >= %.1f (static_min_snr)", n0, int(good.sum()), float(f["min_snr"]),
+             int((shape_ok & ~good).sum()), int((good_lo & ~good).sum()), snr_static)
 
     # ---- 2. centroid errors and per-epoch Gaia calibration
     pix = pixel_scale_arcsec(det, paths)
@@ -311,23 +325,25 @@ def main():
     known = det["gaia_match"].astype(bool)
     if "simbad_match" in det:
         known |= det["simbad_match"].astype(bool)
-    good_v, known_v = good.values, known.values
+    good_v, known_v, lo_v = good.values, known.values, good_lo.values
 
     n_sig = float(f.get("static_n_sigma", 3.0))
     floor = float(f.get("static_floor_arcsec", 1.0))
     cap = float(f.get("static_max_radius_arcsec", max(float(f["static_radius_arcsec"]), 10.0)))
     min_ep = int(f["static_min_epochs"])
     min_span = float(f.get("static_min_span_days", 1.0))
+    min_ep_faint = max(min_ep, int(f.get("static_min_epochs_faint", 5)))
 
-    gi = np.where(good_v)[0]
+    gi = np.where(lo_v)[0]  # static search uses the (possibly lower) static_min_snr
     lab = cluster_detections(x[gi], y[gi], det["pos_err_arcsec"].values[gi],
                              det["epoch_idx"].values[gi], n_sig, floor, cap)
     cl = pd.DataFrame({"lab": lab, "epoch": det["epoch_idx"].values[gi], "mjd": det["mjd"].values[gi],
-                       "known": known_v[gi]})
+                       "known": known_v[gi], "snr": det["snr"].values[gi]})
     agg = cl.groupby("lab").agg(n_ep=("epoch", "nunique"), t0=("mjd", "min"), t1=("mjd", "max"),
-                                has_known=("known", "any"))
+                                has_known=("known", "any"), med_snr=("snr", "median"))
     agg["span"] = agg["t1"] - agg["t0"]
-    agg["is_static"] = (agg["n_ep"] >= min_ep) & (agg["span"] >= min_span)
+    agg["need_ep"] = np.where(agg["med_snr"] < float(f["min_snr"]), min_ep_faint, min_ep)
+    agg["is_static"] = (agg["n_ep"] >= agg["need_ep"]) & (agg["span"] >= min_span)
     a = agg.loc[lab]
 
     n_match = np.full(len(det), np.nan)
@@ -340,10 +356,10 @@ def main():
     cat = np.full(len(det), "bad_quality", dtype=object)
     cat[good_v & known_v] = "known"
     cat[good_v & ~known_v & ~static_row] = "moving"
-    cat[good_v & ~known_v & static_row] = "static"
+    cat[lo_v & ~known_v & static_row] = "static"
     # unlabeled detection sitting in a cluster that contains a Gaia/SIMBAD match = a catalogued star
     # whose match failed in this epoch (e.g. larger astrometric offset): drop it from the unlabeled set
-    cat[good_v & ~known_v & has_known] = "known_star"
+    cat[lo_v & ~known_v & has_known] = "known_star"
     det["category"] = cat
     det["n_epochs_match"], det["span_days"], det["cluster_has_known"] = n_match, span_d, has_known
 
@@ -356,6 +372,27 @@ def main():
     det["object_id"] = oid
 
     log.info("categories: %s", ", ".join(f"{k}={v}" for k, v in det["category"].value_counts().items()))
+
+    # ---- why are there so few static objects? clusters that came close
+    cl["x"], cl["y"] = x[gi], y[gi]
+    agg = agg.join(cl.groupby("lab").agg(x=("x", "mean"), y=("y", "mean"), mean_snr=("snr", "mean")))
+    unl = agg[~agg["has_known"]]
+    few_ep, short = unl["n_ep"] < unl["need_ep"], unl["span"] < min_span
+    log.info("unlabeled position clusters (not Gaia/SIMBAD): %d | static: %d | seen in only 1 epoch: %d | "
+             "failed only n_epochs: %d | failed only span (<%g d): %d | failed both: %d",
+             len(unl), int(unl["is_static"].sum()), int((unl["n_ep"] == 1).sum()),
+             int((few_ep & ~short & (unl["n_ep"] >= 2)).sum()), min_span, int((~few_ep & short).sum()),
+             int((few_ep & short & (unl["n_ep"] >= 2)).sum()))
+    near = unl[~unl["is_static"] & (unl["n_ep"] >= 2)].copy()
+    fe, sh = few_ep[near.index], short[near.index]
+    near["reason"] = np.where(fe & sh, "n_epochs and span",
+                              np.where(fe, "n_epochs<" + near["need_ep"].astype(int).astype(str), f"span<{min_span:g} d"))
+    near["ra"], near["dec"] = helpers.offsets_to_radec(near["x"].values, near["y"].values, ra0, dec0)
+    near = near.rename(columns={"n_ep": "n_epochs", "span": "span_days"})
+    near_csv = out_path(paths, "static_near_misses_csv", "4_static_near_misses.csv")
+    near[["n_epochs", "span_days", "mean_snr", "ra", "dec", "reason"]].sort_values(
+        ["n_epochs", "mean_snr"], ascending=False).to_csv(near_csv, index=False)
+    log.info("static near-misses (>= 2 epochs): %d -> %s", len(near), near_csv)
 
     # ---- 4. outputs
     det.to_csv(out_path(paths, "all_flagged_csv", "3_detections_all_flagged.csv"),

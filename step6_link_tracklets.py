@@ -3,6 +3,11 @@
 Seed pairs (two detections in different epochs of one 'visit') define a constant
 velocity; every other epoch is checked for a detection near the predicted position.
 Tracklets with >= min_detections epochs and a good linear fit are kept.
+
+Every member detection is written as its own row of tracklet_members.csv with its own fitted
+position, residual, time and local sky-plane rate, and tracklets.csv keeps the fitted
+motion model (p0x, p0y, vx, vy, mjd_ref) so step 8 can place a forced aperture on the
+object in ANY exposure of the visit, detected or not.
 """
 import numpy as np
 import pandas as pd
@@ -161,15 +166,32 @@ def main():
             "mjd_start": m["mjd"].min(), "mjd_end": m["mjd"].max(), "mjd_mid": m["mjd"].iloc[mid],
             "ra_mid": float(ra_m), "dec_mid": float(dec_m),
             "rate_arcsec_hr": tr["rate"], "pa_deg": float(np.degrees(np.arctan2(tr["vx"], tr["vy"])) % 360),
-            "total_motion_arcsec": tr["motion"], "rms_arcsec": tr["rms"], "mean_snr": float(m["snr"].mean())})
-        for did, r in m.iterrows():
-            mrows.append({"tracklet_id": k, "det_id": did, "file": r["file"], "epoch_idx": r["epoch_idx"],
-                          "mjd": r["mjd"], "x_pix": r["x_pix"], "y_pix": r["y_pix"],
-                          "ra": r["ra"], "dec": r["dec"], "snr": r["snr"], "flux": r["flux"]})
+            "total_motion_arcsec": tr["motion"], "rms_arcsec": tr["rms"], "mean_snr": float(m["snr"].mean()),
+            "mjd_ref": float(mjd0), "p0x_arcsec": tr["p0x"], "p0y_arcsec": tr["p0y"],
+            "vx_arcsec_hr": tr["vx"], "vy_arcsec_hr": tr["vy"]})
+        # one row per detection: fitted position, residual and local rate between its neighbours
+        t_arr = m["t_hr"].values
+        x_arr, y_arr = m["x"].values, m["y"].values
+        xf, yf = tr["p0x"] + tr["vx"] * t_arr, tr["p0y"] + tr["vy"] * t_arr
+        ra_f, dec_f = helpers.offsets_to_radec(xf, yf, info["ra"], info["dec"])
+        for i, (did, r) in enumerate(m.iterrows()):
+            lo, hi = max(i - 1, 0), min(i + 1, len(m) - 1)
+            dt = t_arr[hi] - t_arr[lo]
+            lvx = (x_arr[hi] - x_arr[lo]) / dt if dt > 0 else np.nan
+            lvy = (y_arr[hi] - y_arr[lo]) / dt if dt > 0 else np.nan
+            mrows.append({"tracklet_id": k, "det_id": did, "det_order": i, "file": r["file"],
+                          "epoch_idx": r["epoch_idx"], "mjd": r["mjd"], "t_hr": float(t_arr[i]),
+                          "x_pix": r["x_pix"], "y_pix": r["y_pix"],
+                          "ra": r["ra"], "dec": r["dec"], "ra_fit": float(ra_f[i]), "dec_fit": float(dec_f[i]),
+                          "resid_arcsec": float(np.hypot(x_arr[i] - xf[i], y_arr[i] - yf[i])),
+                          "local_rate_arcsec_hr": float(np.hypot(lvx, lvy)),
+                          "snr": r["snr"], "flux": r["flux"]})
     mem = pd.DataFrame(mrows)
     tr_cols = ["tracklet_id", "group", "n_det", "mjd_start", "mjd_end", "mjd_mid", "ra_mid", "dec_mid",
-               "rate_arcsec_hr", "pa_deg", "total_motion_arcsec", "rms_arcsec", "mean_snr"]
-    mem_cols = ["tracklet_id", "det_id", "file", "epoch_idx", "mjd", "x_pix", "y_pix", "ra", "dec", "snr", "flux"]
+               "rate_arcsec_hr", "pa_deg", "total_motion_arcsec", "rms_arcsec", "mean_snr",
+               "mjd_ref", "p0x_arcsec", "p0y_arcsec", "vx_arcsec_hr", "vy_arcsec_hr"]
+    mem_cols = ["tracklet_id", "det_id", "det_order", "file", "epoch_idx", "mjd", "t_hr", "x_pix", "y_pix",
+                "ra", "dec", "ra_fit", "dec_fit", "resid_arcsec", "local_rate_arcsec_hr", "snr", "flux"]
     pd.DataFrame(rows, columns=tr_cols).to_csv(paths["tracklets_csv"], index=False)
     (mem if len(mem) else pd.DataFrame(columns=mem_cols)).to_csv(paths["members_csv"], index=False)
     if not kept:
