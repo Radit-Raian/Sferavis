@@ -899,13 +899,6 @@ Optional `config.json` → `static_classification` keys (defaults shown):
 
 The step sets `classified` when it finishes.
 
-### Limits of the Classifier
-
-- It is a **heuristic index scorer**, not a template fit. Treat the class as a first guess to be checked by eye with the step-8 spectrum plot
-- SPHEREx covers only 0.75 to 5 µm. Of the comet features only the 3.4 µm C-H band can be sampled; the 10 and 20 µm bands are outside the data
-- Quasars and Asteroids have no spectral features, so they win mainly by wavelength coverage. A spectrum that covers the whole 0.75 to 5 µm band therefore partly favours the range-only classes
-- The feature windows are narrow compared with the λ/R bins (R of 35 to 128), so a feature may fall between two bins or inside only one
-
 ---
 
 ## References
