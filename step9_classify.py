@@ -1,6 +1,48 @@
-import numpy as np
+"""Step 9 - classify every spectrum from step 8: movers (tracklets) AND static unlabeled sources.
+
+The classifier section (from "SPECTRAL INDEX CLASSIFIER" to "STEP 9") is the original
+sferavis_spectral_index.py code with its logic unchanged. The binned spectrum (wavelength in micron,
+flux in Jy) goes to classify_spectrum(); fewer than 5 spectral points cannot be classified
+('insufficient_points').
+
+MOVERS (tracklets)  -> tracklets/classification.csv
+    One row per tracklet: predicted class, the score of every class, n_points, wavelength range,
+    known_status from step 7, plus the feature strengths found.
+
+STATIC objects (S0000, S0001, ... = detections not in Gaia / SIMBAD that repeat at the same position,
+from step 5; spectra from step 8)  -> catalogs/static_classification.csv
+    Fixed sources (QSOs, supernovae, galaxies, brown dwarfs) are classified with the same classifier but
+    restricted to the classes that make sense for them (Asteroids and Comets are dropped). The wrapper adds
+      * margin: best minus second-best score,
+      * a flat-spectrum baseline: a featureless spectrum already scores ~0.5 per feature window, so a flat
+        spectrum with the SAME wavelength sampling is scored and subtracted -> excess_* columns and
+        predicted_class_flatcorr ('featureless' if no class beats the baseline),
+      * final_class: the predicted class, or insufficient_points / low_snr / ambiguous when the spectrum
+        cannot support a call.
+    Optional config.json -> "static_classification" keys (defaults in brackets)
+      classes          [Brown dwarfs, Quasars, Supernovas, Galaxies]
+      min_points       [8]     fewer binned points -> 'insufficient_points'
+      min_margin       [0.15]  best minus second-best score below this -> 'ambiguous'
+      min_median_snr   [3.0]   median S/N of the binned points below this -> 'low_snr'
+      min_excess       [0.1]   a class must beat the flat baseline by this much, else 'featureless'
+      max_objects      [null]  (used by step 8) measure only the N brightest static objects
+"""
+import json
+import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+import helpers
+
+log = helpers.get_logger("step9")
+
+# ======================================================================
+# SPECTRAL INDEX CLASSIFIER (unchanged)
+# ======================================================================
 
 
 def _clip01(x: float) -> float:
@@ -316,19 +358,142 @@ def classify_spectrum(wavelength_um: np.ndarray, flux: np.ndarray) -> Dict:
     }
 
 
-"""
-# Example (to be removed)
+# ======================================================================
+# STEP 9
+# ======================================================================
+
+STATIC_DEFAULTS = {
+    "classes": ["Brown dwarfs", "Quasars", "Supernovas", "Galaxies"],
+    "min_points": 8,
+    "min_margin": 0.15,
+    "min_median_snr": 3.0,
+    "min_excess": 0.1,
+}
+
+
+def classify_tracklets(paths):
+    """Movers: one row per tracklet -> tracklets/classification.csv (original behaviour)."""
+    trk_path = paths["checked_csv"] if os.path.exists(paths["checked_csv"]) else paths["tracklets_csv"]
+    trk = pd.read_csv(trk_path)
+    rows = []
+    for tr in trk.itertuples():
+        f = os.path.join(paths["spectra_dir"], f"tracklet_{tr.tracklet_id:04d}_spectrum.csv")
+        row = {"tracklet_id": tr.tracklet_id, "n_det": tr.n_det, "rate_arcsec_hr": tr.rate_arcsec_hr,
+               "known_status": getattr(tr, "known_status", ""), "known_name": getattr(tr, "known_name", ""),
+               "predicted_class": "no_spectrum", "n_points": 0}
+        if os.path.exists(f):
+            sp = pd.read_csv(f).dropna(subset=["wavelength_um", "flux_jy"]).sort_values("wavelength_um")
+            row["n_points"] = len(sp)
+            try:
+                res = classify_spectrum(sp["wavelength_um"].values, sp["flux_jy"].values)
+                row.update(predicted_class=res["predicted_class"],
+                           wave_min_um=res["observed_range_um"][0], wave_max_um=res["observed_range_um"][1])
+                for k, v in res["scores"].items():
+                    row[f"score_{k}"] = v
+                row["features"] = json.dumps({k: round(v, 3) for k, v in res["extracted_features"].items()})
+            except ValueError as e:
+                row["predicted_class"] = "insufficient_points"
+                log.info("tracklet %d: %s", tr.tracklet_id, e)
+        rows.append(row)
+        log.info("tracklet %d: %s (%d spectral points)", tr.tracklet_id, row["predicted_class"], row["n_points"])
+
+    out = pd.DataFrame(rows)
+    out.to_csv(paths["classification_csv"], index=False)
+    if len(out):
+        log.info("mover classes: %s", ", ".join(f"{k}={v}" for k, v in out["predicted_class"].value_counts().items()))
+    log.info("Movers -> %s", paths["classification_csv"])
+
+
+def classify_static(w, f, scfg):
+    """Step-9 classifier restricted to the static classes, plus margin and the flat-spectrum baseline.
+    Returns None when the spectrum has fewer than 5 points (classify_spectrum cannot run)."""
+    try:
+        res = classify_spectrum(w, f)
+    except ValueError:
+        return None
+    allowed = [c for c in scfg["classes"] if c in res["scores"]]
+    scores = {k: res["scores"][k] for k in allowed}
+    order = sorted(scores, key=scores.get, reverse=True)
+    margin = scores[order[0]] - scores[order[1]] if len(order) > 1 else np.nan
+    base = classify_spectrum(w, np.ones_like(w))["scores"]   # flat spectrum, same wavelength sampling
+    excess = {k: scores[k] - base[k] for k in allowed}
+    best_x = max(excess, key=excess.get)
+    if excess[best_x] < scfg["min_excess"]:  # no class beats a flat spectrum: do not pick one by dict order
+        best_x = "featureless"
+    return {"best": order[0], "margin": margin, "scores": scores, "excess": excess,
+            "best_flatcorr": best_x, "res": res}
+
+
+def static_final_label(n_points, median_snr, cl, scfg):
+    if cl is None or n_points < scfg["min_points"]:
+        return "insufficient_points"
+    if not np.isfinite(median_snr) or median_snr < scfg["min_median_snr"]:
+        return "low_snr"
+    if not np.isfinite(cl["margin"]) or cl["margin"] < scfg["min_margin"]:
+        return "ambiguous"
+    return cl["best"]
+
+
+def classify_static_objects(config, paths):
+    """Static unlabeled sources: one row per object -> catalogs/static_classification.csv."""
+    scfg = {**STATIC_DEFAULTS, **config.get("static_classification", {})}
+    cols = ["object_id", "ra", "dec", "pos_err_arcsec", "det_mean_snr", "n_det_epochs", "n_exposures",
+            "n_points", "wave_min_um", "wave_max_um", "median_snr", "final_class", "predicted_class",
+            "margin", "predicted_class_flatcorr"]
+    stat_csv = paths.get("unlabeled_static_csv") or os.path.join(paths["catalog_dir"],
+                                                                 "4_unlabeled_static_objects.csv")
+    stat = pd.read_csv(stat_csv) if os.path.exists(stat_csv) else pd.DataFrame()
+    if stat.empty or "ra" not in stat:
+        log.info("No static unlabeled objects - nothing to classify.")
+        pd.DataFrame(columns=cols).to_csv(paths["static_classification_csv"], index=False)
+        return
+    stat = stat.sort_values("mean_snr", ascending=False).reset_index(drop=True)
+    n_exp = {}
+    if os.path.exists(paths["static_spectrum_csv"]):
+        n_exp = pd.read_csv(paths["static_spectrum_csv"]).groupby("object_id").size().to_dict()
+
+    rows = []
+    for s in stat.itertuples():
+        row = {"object_id": s.object_id, "ra": s.ra, "dec": s.dec, "pos_err_arcsec": s.pos_err_arcsec,
+               "det_mean_snr": s.mean_snr, "n_det_epochs": s.n_epochs, "n_exposures": n_exp.get(s.object_id, 0),
+               "n_points": 0, "final_class": "no_spectrum"}
+        f = os.path.join(paths["static_spectra_dir"], f"{s.object_id}_spectrum.csv")
+        if os.path.exists(f):
+            b = pd.read_csv(f).dropna(subset=["wavelength_um", "flux_jy"]).sort_values("wavelength_um")
+            snr = b["flux_jy"].values / b["err_jy"].values if len(b) else np.array([])
+            med_snr = float(np.nanmedian(snr)) if len(snr) else np.nan
+            cl = classify_static(b["wavelength_um"].values, b["flux_jy"].values, scfg) if len(b) else None
+            row.update(n_points=len(b), median_snr=med_snr,
+                       final_class=static_final_label(len(b), med_snr, cl, scfg))
+            if cl is not None:
+                row.update(predicted_class=cl["best"], margin=cl["margin"],
+                           predicted_class_flatcorr=cl["best_flatcorr"],
+                           wave_min_um=cl["res"]["observed_range_um"][0],
+                           wave_max_um=cl["res"]["observed_range_um"][1])
+                row.update({f"score_{k}": v for k, v in cl["scores"].items()})
+                row.update({f"excess_{k}": v for k, v in cl["excess"].items()})
+                row["features"] = json.dumps({k: round(v, 3) for k, v in cl["res"]["extracted_features"].items()})
+        rows.append(row)
+        log.info("static %s: %s (%d bins)", s.object_id, row["final_class"], row["n_points"])
+
+    out = pd.DataFrame(rows)
+    out = out[[c for c in cols if c in out] + [c for c in out if c not in cols]]
+    out.to_csv(paths["static_classification_csv"], index=False)
+    log.info("static classes: %s", ", ".join(f"{k}={v}" for k, v in out["final_class"].value_counts().items()))
+    log.info("Static objects -> %s", paths["static_classification_csv"])
+
+
+def main():
+    t0 = time.time()
+    config = helpers.load_config()
+    helpers.require_flag(config, "spectra_extracted", "step8_extract_spectra.py")
+    paths = helpers.get_paths(config)
+
+    classify_tracklets(paths)
+    classify_static_objects(config, paths)
+    log.info("Step 9 done in %.1f s", time.time() - t0)
+    helpers.set_flag("classified")
+
 
 if __name__ == "__main__":
-    # Dummy test: create a synthetic BD-like absorption spectrum on 1.0–2.5 μm
-    w = np.linspace(1.0, 2.5, 2000)
-    f = np.ones_like(w)
-
-    # add absorption dips
-    for center, amp, width in [(1.19, 0.4, 0.015), (2.295, 0.35, 0.03), (2.20, 0.5, 0.02), (1.667, 0.45, 0.02)]:
-        f -= amp * np.exp(-0.5 * ((w - center) / width) ** 2)
-
-    res = classify_spectrum(w, f)
-    print(res["predicted_class"])
-    print(res["scores"])
-"""
+    main()
